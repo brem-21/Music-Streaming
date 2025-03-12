@@ -38,7 +38,7 @@ The data pipeline follows the **ETL (Extract, Transform, Load) workflow**:
 
 - **Apache Airflow** (DAG orchestration)
 - **Amazon S3** (Streaming data storage)
-- \*\*Amazon RDS (CS\*\*\*\*V \*\***Simulation)** (Metadata source)
+- \*\*Amazon RDS (CSV **Simulation)** (Metadata source)
 - **Amazon Redshift** (Data warehouse for analytics)
 - **Python** (Data processing scripts)
 - **SQL** (Queries for Redshift data validation)V \*\*
