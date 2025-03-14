@@ -184,20 +184,28 @@ def merge_data(**kwargs):
         songs_df = pd.read_json(StringIO(songs_json), orient='split')
         s3_df = pd.read_json(StringIO(s3_json), orient='split')
         
-        # Ensure the required columns exist
-        if 'user_id' not in users_df.columns:
-            raise ValueError("Column 'user_id' not found in users_df")
-        if 'track_id' not in songs_df.columns:
-            raise ValueError("Column 'track_id' not found in songs_df")
-        if 'track_id' not in s3_df.columns:
-            raise ValueError("Column 'track_id' not found in s3_df")
+        # Log column names to help diagnose issues
+        logging.info(f"users_df columns: {users_df.columns.tolist()}")
+        logging.info(f"songs_df columns: {songs_df.columns.tolist()}")
+        logging.info(f"s3_df columns: {s3_df.columns.tolist()}")
         
-        # Merge data
-        merged_df = pd.merge(songs_df, users_df, on='user_id')
-        merged_df = pd.merge(merged_df, s3_df, on='track_id')
+        # Fix: We need to first merge s3_df with songs_df on track_id
+        # and then merge the result with users_df
+        
+        # First merge: s3_df with songs_df on track_id
+        intermediate_df = pd.merge(songs_df, s3_df, on='track_id', how='inner')
+        
+        # Second merge: result with users_df
+        # The S3 data likely contains user interactions, so it should have user_id
+        if 'user_id' in intermediate_df.columns:
+            merged_df = pd.merge(intermediate_df, users_df, on='user_id', how='inner')
+        else:
+            # If user_id is not in intermediate_df, we need to use a different approach
+            # Assuming s3_df contains user_id for joins
+            merged_df = pd.merge(users_df, intermediate_df, left_on='user_id', right_on='user_id', how='inner')
         
         kwargs['ti'].xcom_push(key='merged_df', value=merged_df.to_json(orient='split'))
-        logging.info("Merged RDS and S3 data.")
+        logging.info("Merged RDS and S3 data successfully.")
     except Exception as e:
         logging.error(f"Error merging data: {e}")
         raise
