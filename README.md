@@ -20,6 +20,8 @@ This project implements an **ETL (Extract, Transform, Load) data pipeline** for 
 - **Efficient data loading** into Amazon Redshift using an **Upsert strategy**.
 - **Logging and error handling** for monitoring and troubleshooting.
 
+![dag_run](<data/Screenshot from 2025-03-14 21-46-23.png>)
+
 ## Architecture
 
 The data pipeline follows the **ETL (Extract, Transform, Load) workflow**:
@@ -33,6 +35,8 @@ The data pipeline follows the **ETL (Extract, Transform, Load) workflow**:
 3. **Loading:**
    - Insert transformed data into Amazon Redshift.
    - Use **staging tables** and **Upsert strategy** to handle new and duplicate records.
+
+   ![architecture](data/diagram-export-3-14-2025-10_32_14-AM.png)
 
 ## Technology Stack
 
