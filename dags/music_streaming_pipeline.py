@@ -1,153 +1,352 @@
-from datetime import datetime
-import logging
 from airflow import DAG
-from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.operators.python_operator import PythonOperator, BranchPythonOperator
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.hooks.base_hook import BaseHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-import pandas as pd
-from io import StringIO
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.providers.amazon.aws.hooks.redshift_sql import RedshiftSQLHook
 from airflow.models import Variable
-from airflow.operators.empty import EmptyOperator
-from airflow.operators.python import PythonOperator, BranchPythonOperator
+from datetime import datetime, timedelta
+import pandas as pd
+import logging
+from io import StringIO  # Import StringIO for JSON handling
 
 # Constants
-S3_BUCKET_NAME = Variable.get("S3_BUCKET_NAME")  
-AWS_CONN_ID = "aws_conn"
 REDSHIFT_CONN_ID = "redshift_conn"
 RDS_CONN_ID = "aws_rds_connection"
+S3_BUCKET = Variable.get("S3_BUCKET_NAME")
+AWS_RDS_CONNECTION = "aws_rds_connection"
+AWS_CONN_ID = "aws_conn"
+S3_ARCHIVE_FOLDER = "archive"
+BATCH_SIZE = 1000  # Define batch size for extraction
 
-# Task 1: Check if RDS has data
-def check_rds_data():
-    pg_hook = PostgresHook(postgres_conn_id=RDS_CONN_ID)
-    results = pg_hook.get_first("SELECT * FROM public.songs LIMIT 1;")
-    return "fetch_data_from_RDS" if results else "stop_dag_no_rds_data"
+# Default arguments for the DAG
+default_args = {
+    'owner': 'data_engineer',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 3, 14),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
 
-# Task 2: Fetch data from RDS
-def fetch_data_from_RDS(**kwargs):
-    pg_hook = PostgresHook(postgres_conn_id=RDS_CONN_ID)
-    results = pg_hook.get_records("SELECT * FROM public.songs;")
-    kwargs['ti'].xcom_push(key="rds_data", value=results)
-
-# Task 3: Check for S3 files
-def check_for_s3_files(**kwargs):
-    s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
-    keys = s3_hook.list_keys(S3_BUCKET_NAME)
-    csv_keys = [k for k in keys if k.endswith('.csv')] if keys else []
-    kwargs['ti'].xcom_push(key="csv_keys", value=csv_keys)
-    return "validate_columns" if csv_keys else "stop_dag_no_s3_files"
-
-# Task 4: Validate CSV Schema
-def validate_data_columns(**kwargs):
-    ti = kwargs['ti']
-    keys = ti.xcom_pull(task_ids="check_s3_files", key="csv_keys")
-    if not keys:
-        return "stop_dag_invalid_columns"
-    
-    s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
-    valid_keys = []
-    expected_columns = {'user_id', 'track_id', 'listen_time'}
-    
-    for key in keys:
-        obj = s3_hook.get_key(key, bucket_name=S3_BUCKET_NAME)
-        data = obj.get()['Body'].read().decode('utf-8')
-        df = pd.read_csv(StringIO(data))
-        if set(df.columns) == expected_columns:
-            valid_keys.append(key)
-    
-    return "compute_kpis" if valid_keys else "stop_dag_invalid_columns"
-
-# Task 5: Create KPI Table
-def create_kpi_table():
-    hook = PostgresHook(postgres_conn_id=REDSHIFT_CONN_ID)
-    sql = """
-    CREATE TABLE IF NOT EXISTS Music_Streaming_KPIs (
-        kpi_date DATE,
-        kpi_hour INT,
-        genre VARCHAR(255),
-        listen_count INT,
-        avg_track_duration FLOAT,
-        popularity_index FLOAT,
-        most_popular_track VARCHAR(255),
-        unique_listeners INT,
-        top_artist VARCHAR(255),
-        track_diversity_index FLOAT
-    );
-    """
-    hook.run(sql)
-
-# Task 6: Compute KPIs
-def compute_kpis(**kwargs):
-    ti = kwargs['ti']
-    rds_data = ti.xcom_pull(task_ids='fetch_data_from_RDS', key='rds_data')
-    
-    if not rds_data:
-        return "stop_dag_no_rds_data"
-    
-    df = pd.DataFrame(rds_data, columns=['id', 'track_name', 'artist', 'genre', 'duration', 'popularity'])
-    kpi_df = df.groupby('genre').agg(
-        listen_count=('track_name', 'count'),
-        avg_track_duration=('duration', 'mean'),
-        popularity_index=('popularity', 'mean'),
-        most_popular_track=('track_name', lambda x: x.value_counts().idxmax())
-    ).reset_index()
-    
-    hook = PostgresHook(postgres_conn_id=REDSHIFT_CONN_ID)
-    for _, row in kpi_df.iterrows():
-        sql = f"""
-        INSERT INTO Music_Streaming_KPIs (kpi_date, kpi_hour, genre, listen_count, avg_track_duration, popularity_index, most_popular_track)
-        VALUES (CURRENT_DATE, EXTRACT(HOUR FROM CURRENT_TIMESTAMP), '{row['genre']}', {row['listen_count']}, {row['avg_track_duration']}, {row['popularity_index']}, '{row['most_popular_track']}')
-        """
-        hook.run(sql)
-
-# DAG Definition
-with DAG(
-    dag_id='music_streaming_kpi',
-    start_date=datetime(2025, 3, 13),
+# Initialize the DAG
+dag = DAG(
+    'Music_Streaming_ETL_Pipeline',
+    default_args=default_args,
+    description='ETL Pipeline for Music Data with Batched Extraction',
     schedule_interval='@daily',
-    catchup=False
-) as dag:
-    
-    check_rds = BranchPythonOperator(
-        task_id='check_rds_data',
-        python_callable=check_rds_data
-    )
-    
-    stop_dag_no_rds_data = EmptyOperator(task_id="stop_dag_no_rds_data")
-    
-    fetch_rds_data = PythonOperator(
-        task_id='fetch_data_from_RDS',
-        python_callable=fetch_data_from_RDS,
-        provide_context=True
-    )
-    
-    check_s3 = BranchPythonOperator(
-        task_id='check_s3_files',
-        python_callable=check_for_s3_files,
-        provide_context=True
-    )
-    
-    stop_dag_no_s3_files = EmptyOperator(task_id="stop_dag_no_s3_files")
-    
-    validate_s3 = BranchPythonOperator(
-        task_id='validate_columns',
-        python_callable=validate_data_columns,
-        provide_context=True
-    )
-    
-    stop_dag_invalid_columns = EmptyOperator(task_id="stop_dag_invalid_columns")
-    
-    create_kpi = PythonOperator(
-        task_id='create_kpi_table',
-        python_callable=create_kpi_table
-    )
-    
-    compute_kpis_task = PythonOperator(
-        task_id='compute_kpis',
-        python_callable=compute_kpis,
-        provide_context=True
-    )
-    
-    check_rds >> [fetch_rds_data, stop_dag_no_rds_data]
-    fetch_rds_data >> check_s3
-    check_s3 >> [validate_s3, stop_dag_no_s3_files]
-    validate_s3 >> [compute_kpis_task, stop_dag_invalid_columns]
-    compute_kpis_task >> create_kpi
+    catchup=False,
+)
+
+# Task 1: Check for data in RDS database (users and songs tables)
+def check_rds_data(**kwargs):
+    try:
+        hook = PostgresHook(postgres_conn_id=RDS_CONN_ID)
+        users_count = hook.get_first("SELECT COUNT(*) FROM users")[0]
+        songs_count = hook.get_first("SELECT COUNT(*) FROM songs")[0]
+        
+        if users_count == 0 or songs_count == 0:
+            logging.info("No data in RDS database. Ending DAG.")
+            return "end_dag"
+        else:
+            logging.info("Data found in RDS database. Proceeding to fetch data.")
+            return "fetch_rds_users"
+    except Exception as e:
+        logging.error(f"Error checking RDS data: {e}")
+        raise
+
+check_rds_data_task = BranchPythonOperator(
+    task_id='check_rds_data',
+    python_callable=check_rds_data,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 2: Fetch users data from RDS in batches
+def fetch_rds_users(**kwargs):
+    try:
+        hook = PostgresHook(postgres_conn_id=RDS_CONN_ID)
+        offset = 0
+        users_df = pd.DataFrame()
+        
+        while True:
+            batch = hook.get_pandas_df(
+                f"SELECT * FROM users ORDER BY user_id LIMIT {BATCH_SIZE} OFFSET {offset}"
+            )
+            if batch.empty:
+                break
+            users_df = pd.concat([users_df, batch], ignore_index=True)
+            offset += BATCH_SIZE
+        
+        kwargs['ti'].xcom_push(key='users_df', value=users_df.to_json(orient='split'))
+        logging.info("Fetched users data from RDS in batches.")
+    except Exception as e:
+        logging.error(f"Error fetching users data from RDS: {e}")
+        raise
+
+fetch_rds_users_task = PythonOperator(
+    task_id='fetch_rds_users',
+    python_callable=fetch_rds_users,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 3: Fetch songs data from RDS in batches
+def fetch_rds_songs(**kwargs):
+    try:
+        hook = PostgresHook(postgres_conn_id=RDS_CONN_ID)
+        offset = 0
+        songs_df = pd.DataFrame()
+        
+        while True:
+            batch = hook.get_pandas_df(
+                f"SELECT * FROM songs ORDER BY track_id LIMIT {BATCH_SIZE} OFFSET {offset}"
+            )
+            if batch.empty:
+                break
+            songs_df = pd.concat([songs_df, batch], ignore_index=True)
+            offset += BATCH_SIZE
+        
+        kwargs['ti'].xcom_push(key='songs_df', value=songs_df.to_json(orient='split'))
+        logging.info("Fetched songs data from RDS in batches.")
+    except Exception as e:
+        logging.error(f"Error fetching songs data from RDS: {e}")
+        raise
+
+fetch_rds_songs_task = PythonOperator(
+    task_id='fetch_rds_songs',
+    python_callable=fetch_rds_songs,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 4: Check for files in S3 bucket
+def check_s3_files(**kwargs):
+    try:
+        s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+        files = s3_hook.list_keys(bucket_name=S3_BUCKET)
+        
+        if not files:
+            logging.info("No files in S3 bucket. Ending DAG.")
+            return "end_dag"
+        else:
+            logging.info("Files found in S3 bucket. Proceeding to fetch data.")
+            return "fetch_s3_data"
+    except Exception as e:
+        logging.error(f"Error checking S3 files: {e}")
+        raise
+
+check_s3_files_task = BranchPythonOperator(
+    task_id='check_s3_files',
+    python_callable=check_s3_files,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 5: Fetch S3 data in batches
+def fetch_s3_data(**kwargs):
+    try:
+        s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+        files = s3_hook.list_keys(bucket_name=S3_BUCKET)
+        s3_data = []
+        
+        for file in files:
+            obj = s3_hook.get_key(file, bucket_name=S3_BUCKET)
+            df = pd.read_csv(obj.get()['Body'])
+            s3_data.append(df)
+        
+        # Concatenate all dataframes
+        s3_df = pd.concat(s3_data, ignore_index=True)  # Reset index to ensure uniqueness
+        
+        # Push the dataframe to XCom as JSON
+        kwargs['ti'].xcom_push(key='s3_df', value=s3_df.to_json(orient='split'))  # Use 'split' orient for non-unique indexes
+        logging.info("Fetched S3 data in batches.")
+    except Exception as e:
+        logging.error(f"Error fetching S3 data: {e}")
+        raise
+
+fetch_s3_data_task = PythonOperator(
+    task_id='fetch_s3_data',
+    python_callable=fetch_s3_data,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 6: Merge RDS and S3 data into one dataframe
+def merge_data(**kwargs):
+    try:
+        users_json = kwargs['ti'].xcom_pull(task_ids='fetch_rds_users', key='users_df')
+        songs_json = kwargs['ti'].xcom_pull(task_ids='fetch_rds_songs', key='songs_df')
+        s3_json = kwargs['ti'].xcom_pull(task_ids='fetch_s3_data', key='s3_df')
+        
+        users_df = pd.read_json(StringIO(users_json), orient='split')
+        songs_df = pd.read_json(StringIO(songs_json), orient='split')
+        s3_df = pd.read_json(StringIO(s3_json), orient='split')
+        
+        # Ensure the required columns exist
+        if 'user_id' not in users_df.columns:
+            raise ValueError("Column 'user_id' not found in users_df")
+        if 'track_id' not in songs_df.columns:
+            raise ValueError("Column 'track_id' not found in songs_df")
+        if 'track_id' not in s3_df.columns:
+            raise ValueError("Column 'track_id' not found in s3_df")
+        
+        # Merge data
+        merged_df = pd.merge(songs_df, users_df, on='user_id')
+        merged_df = pd.merge(merged_df, s3_df, on='track_id')
+        
+        kwargs['ti'].xcom_push(key='merged_df', value=merged_df.to_json(orient='split'))
+        logging.info("Merged RDS and S3 data.")
+    except Exception as e:
+        logging.error(f"Error merging data: {e}")
+        raise
+
+merge_data_task = PythonOperator(
+    task_id='merge_data',
+    python_callable=merge_data,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 7: Compute KPIs
+def compute_kpis(**kwargs):
+    try:
+        merged_df = pd.read_json(kwargs['ti'].xcom_pull(task_ids='merge_data', key='merged_df'), orient='split')
+        
+        # Daily Genre-Level KPIs
+        genre_kpis = merged_df.groupby('genre').agg(
+            listen_count=('play_count', 'sum'),
+            average_track_duration=('duration', 'mean'),
+            popularity_index=('play_count', 'sum') + ('likes', 'sum') + ('shares', 'sum'),
+            most_popular_track=('track_id', lambda x: x.value_counts().idxmax())
+        ).reset_index()
+        
+        # Hourly KPIs
+        merged_df['hour'] = pd.to_datetime(merged_df['timestamp']).dt.hour
+        hourly_kpis = merged_df.groupby('hour').agg(
+            unique_listeners=('user_id', 'nunique'),
+            top_artists=('artist_id', lambda x: x.value_counts().idxmax()),
+            track_diversity_index=('track_id', lambda x: x.nunique() / x.count())
+        ).reset_index()
+        
+        kwargs['ti'].xcom_push(key='genre_kpis', value=genre_kpis.to_json(orient='split'))
+        kwargs['ti'].xcom_push(key='hourly_kpis', value=hourly_kpis.to_json(orient='split'))
+        logging.info("Computed KPIs.")
+    except Exception as e:
+        logging.error(f"Error computing KPIs: {e}")
+        raise
+
+compute_kpis_task = PythonOperator(
+    task_id='compute_kpis',
+    python_callable=compute_kpis,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 8: Create KPI table in Redshift
+def create_kpi_table_in_redshift(**kwargs):
+    """
+    Create the KPI table in Amazon Redshift if it doesn't exist.
+    """
+    try:
+        create_table_query = """
+        CREATE TABLE IF NOT EXISTS music_kpi_metrics (
+            track_genre VARCHAR(255),
+            listen_count INT,
+            avg_track_duration_sec FLOAT,
+            popularity_index FLOAT,
+            most_popular_track VARCHAR(255),
+            stream_hour INT,
+            unique_listeners INT,
+            top_artists VARCHAR(255),
+            track_diversity_index FLOAT,
+            kpi_type VARCHAR(50)
+        );
+        """
+        
+        redshift_hook = RedshiftSQLHook(redshift_conn_id=REDSHIFT_CONN_ID)
+        redshift_hook.run(create_table_query)
+        logging.info("Table `music_kpi_metrics` is ready in Redshift.")
+    except Exception as e:
+        logging.error(f"Error creating KPI table in Redshift: {e}")
+        raise
+
+create_kpi_table_task = PythonOperator(
+    task_id='create_kpi_table_in_redshift',
+    python_callable=create_kpi_table_in_redshift,
+    provide_context=True,
+    dag=dag,
+)
+
+# Task 9: Load genre KPIs into Redshift using SQL
+load_genre_kpis_task = PostgresOperator(
+    task_id='load_genre_kpis',
+    postgres_conn_id=REDSHIFT_CONN_ID,
+    sql="""
+    INSERT INTO music_kpi_metrics (track_genre, listen_count, avg_track_duration_sec, popularity_index, most_popular_track, kpi_type)
+    VALUES (%s, %s, %s, %s, %s, 'genre');
+    """,
+    parameters=[
+        ('{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["genre"] }}',
+         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["listen_count"] }}',
+         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["average_track_duration"] }}',
+         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["popularity_index"] }}',
+         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["most_popular_track"] }}')
+    ],
+    dag=dag,
+)
+
+# Task 10: Load hourly KPIs into Redshift using SQL
+load_hourly_kpis_task = PostgresOperator(
+    task_id='load_hourly_kpis',
+    postgres_conn_id=REDSHIFT_CONN_ID,
+    sql="""
+    INSERT INTO music_kpi_metrics (stream_hour, unique_listeners, top_artists, track_diversity_index, kpi_type)
+    VALUES (%s, %s, %s, %s, 'hourly');
+    """,
+    parameters=[
+        ('{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["hour"] }}',
+         '{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["unique_listeners"] }}',
+         '{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["top_artists"] }}',
+         '{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["track_diversity_index"] }}')
+    ],
+    dag=dag,
+)
+
+# Task 11: Archive data
+def archive_data(**kwargs):
+    try:
+        # Archive S3 files
+        s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID)
+        files = s3_hook.list_keys(bucket_name=S3_BUCKET)
+        
+        for file in files:
+            new_key = f"{S3_ARCHIVE_FOLDER}/{file.split('/')[-1]}"
+            s3_hook.copy_object(source_bucket_name=S3_BUCKET, dest_bucket_name=S3_BUCKET, source_bucket_key=file, dest_bucket_key=new_key)
+            s3_hook.delete_objects(bucket=S3_BUCKET, keys=file)
+        
+        logging.info("Data archived successfully.")
+    except Exception as e:
+        logging.error(f"Error archiving data: {e}")
+        raise
+
+archive_data_task = PythonOperator(
+    task_id='archive_data',
+    python_callable=archive_data,
+    provide_context=True,
+    dag=dag,
+)
+
+# Dummy operator to end the DAG
+end_dag = DummyOperator(task_id='end_dag', dag=dag)
+
+# Define task dependencies
+check_rds_data_task >> [fetch_rds_users_task, end_dag]
+fetch_rds_users_task >> fetch_rds_songs_task
+fetch_rds_songs_task >> merge_data_task
+
+check_s3_files_task >> [fetch_s3_data_task, end_dag]
+fetch_s3_data_task >> merge_data_task
+
+merge_data_task >> create_kpi_table_task >> compute_kpis_task >> [load_genre_kpis_task, load_hourly_kpis_task] >> archive_data_task >> end_dag
