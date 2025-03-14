@@ -18,7 +18,7 @@ RDS_CONN_ID = "aws_rds_connection"
 S3_BUCKET = Variable.get("S3_BUCKET_NAME")
 AWS_RDS_CONNECTION = "aws_rds_connection"
 AWS_CONN_ID = "aws_conn"
-S3_ARCHIVE_FOLDER = "archive"
+S3_ARCHIVE_FOLDER = Variable.get("archive")
 BATCH_SIZE = 1000  # Define batch size for extraction
 
 # Default arguments for the DAG
@@ -238,19 +238,20 @@ def compute_kpis(**kwargs):
             track_diversity_index=('track_id', lambda x: x.nunique() / x.count())
         ).reset_index()
         
+        # Store as JSON string instead of list of dicts for proper XCom handling
         kwargs['ti'].xcom_push(key='genre_kpis', value=genre_kpis.to_json(orient='split'))
         kwargs['ti'].xcom_push(key='hourly_kpis', value=hourly_kpis.to_json(orient='split'))
+
         logging.info("Computed KPIs.")
     except Exception as e:
         logging.error(f"Error computing KPIs: {e}")
         raise
-
 compute_kpis_task = PythonOperator(
     task_id='compute_kpis',
     python_callable=compute_kpis,
     provide_context=True,
     dag=dag,
-)
+    )
 
 # Task 8: Create KPI table in Redshift
 def create_kpi_table_in_redshift(**kwargs):
@@ -288,37 +289,77 @@ create_kpi_table_task = PythonOperator(
 )
 
 # Task 9: Load genre KPIs into Redshift using SQL
-load_genre_kpis_task = PostgresOperator(
+def load_genre_kpis_to_redshift(**kwargs):
+    try:
+        # Pull the KPIs from XCom
+        genre_kpis_json = kwargs['ti'].xcom_pull(task_ids='compute_kpis', key='genre_kpis')
+        genre_kpis_df = pd.read_json(StringIO(genre_kpis_json), orient='split')
+        
+        # Get Redshift connection
+        redshift_hook = RedshiftSQLHook(redshift_conn_id=REDSHIFT_CONN_ID)
+        
+        # Insert each row into the database
+        for index, row in genre_kpis_df.iterrows():
+            sql = """
+            INSERT INTO music_kpi_metrics 
+            (track_genre, listen_count, avg_track_duration_sec, popularity_index, most_popular_track, kpi_type)
+            VALUES (%s, %s, %s, %s, %s, 'genre');
+            """
+            parameters = (
+                row['track_genre'],
+                int(row['listen_count']),
+                float(row['average_track_duration']),
+                float(row['popularity_index']),
+                str(row['most_popular_track'])
+            )
+            redshift_hook.run(sql, parameters=parameters)
+        
+        logging.info(f"Loaded {len(genre_kpis_df)} genre KPI records into Redshift")
+    except Exception as e:
+        logging.error(f"Error loading genre KPIs to Redshift: {e}")
+        raise
+
+load_genre_kpis_task = PythonOperator(
     task_id='load_genre_kpis',
-    postgres_conn_id=REDSHIFT_CONN_ID,
-    sql="""
-    INSERT INTO music_kpi_metrics (track_genre, listen_count, avg_track_duration_sec, popularity_index, most_popular_track, kpi_type)
-    VALUES (%s, %s, %s, %s, %s, 'genre');
-    """,
-    parameters=[
-        ('{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["genre"] }}',
-         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["listen_count"] }}',
-         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["average_track_duration"] }}',
-         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["popularity_index"] }}',
-         '{{ ti.xcom_pull(task_ids="compute_kpis", key="genre_kpis")["most_popular_track"] }}')
-    ],
+    python_callable=load_genre_kpis_to_redshift,
+    provide_context=True,
     dag=dag,
 )
 
 # Task 10: Load hourly KPIs into Redshift using SQL
-load_hourly_kpis_task = PostgresOperator(
+def load_hourly_kpis_to_redshift(**kwargs):
+    try:
+        # Pull the KPIs from XCom
+        hourly_kpis_json = kwargs['ti'].xcom_pull(task_ids='compute_kpis', key='hourly_kpis')
+        hourly_kpis_df = pd.read_json(StringIO(hourly_kpis_json), orient='split')
+        
+        # Get Redshift connection
+        redshift_hook = RedshiftSQLHook(redshift_conn_id=REDSHIFT_CONN_ID)
+        
+        # Insert each row into the database
+        for index, row in hourly_kpis_df.iterrows():
+            sql = """
+            INSERT INTO music_kpi_metrics 
+            (stream_hour, unique_listeners, top_artists, track_diversity_index, kpi_type)
+            VALUES (%s, %s, %s, %s, 'hourly');
+            """
+            parameters = (
+                int(row['hour']),
+                int(row['unique_listeners']),
+                str(row['top_artists']),
+                float(row['track_diversity_index'])
+            )
+            redshift_hook.run(sql, parameters=parameters)
+        
+        logging.info(f"Loaded {len(hourly_kpis_df)} hourly KPI records into Redshift")
+    except Exception as e:
+        logging.error(f"Error loading hourly KPIs to Redshift: {e}")
+        raise
+
+load_hourly_kpis_task = PythonOperator(
     task_id='load_hourly_kpis',
-    postgres_conn_id=REDSHIFT_CONN_ID,
-    sql="""
-    INSERT INTO music_kpi_metrics (stream_hour, unique_listeners, top_artists, track_diversity_index, kpi_type)
-    VALUES (%s, %s, %s, %s, 'hourly');
-    """,
-    parameters=[
-        ('{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["hour"] }}',
-         '{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["unique_listeners"] }}',
-         '{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["top_artists"] }}',
-         '{{ ti.xcom_pull(task_ids="compute_kpis", key="hourly_kpis")["track_diversity_index"] }}')
-    ],
+    python_callable=load_hourly_kpis_to_redshift,
+    provide_context=True,
     dag=dag,
 )
 
