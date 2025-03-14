@@ -224,9 +224,9 @@ def compute_kpis(**kwargs):
         
         # Daily Genre-Level KPIs
         genre_kpis = merged_df.groupby('track_genre').agg(
-            listen_count=('play_count', 'sum'),
-            average_track_duration=('duration', 'mean'),
-            popularity_index=('play_count', 'sum') + ('likes', 'sum') + ('shares', 'sum'),
+            listen_count=('id', 'count'),  # Count of listens per genre
+            average_track_duration=('duration_ms', 'mean'),
+            popularity_index=('popularity', 'sum'),
             most_popular_track=('track_id', lambda x: x.value_counts().idxmax())
         ).reset_index()
         
@@ -234,7 +234,7 @@ def compute_kpis(**kwargs):
         merged_df['hour'] = pd.to_datetime(merged_df['listen_time']).dt.hour
         hourly_kpis = merged_df.groupby('hour').agg(
             unique_listeners=('user_id', 'nunique'),
-            top_artists=('artist_id', lambda x: x.value_counts().idxmax()),
+            top_artists=('artists', lambda x: x.value_counts().idxmax()),
             track_diversity_index=('track_id', lambda x: x.nunique() / x.count())
         ).reset_index()
         
