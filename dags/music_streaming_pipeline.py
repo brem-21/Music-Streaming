@@ -223,7 +223,7 @@ def compute_kpis(**kwargs):
         merged_df = pd.read_json(kwargs['ti'].xcom_pull(task_ids='merge_data', key='merged_df'), orient='split')
         
         # Daily Genre-Level KPIs
-        genre_kpis = merged_df.groupby('genre').agg(
+        genre_kpis = merged_df.groupby('track_genre').agg(
             listen_count=('play_count', 'sum'),
             average_track_duration=('duration', 'mean'),
             popularity_index=('play_count', 'sum') + ('likes', 'sum') + ('shares', 'sum'),
@@ -231,7 +231,7 @@ def compute_kpis(**kwargs):
         ).reset_index()
         
         # Hourly KPIs
-        merged_df['hour'] = pd.to_datetime(merged_df['timestamp']).dt.hour
+        merged_df['hour'] = pd.to_datetime(merged_df['listen_time']).dt.hour
         hourly_kpis = merged_df.groupby('hour').agg(
             unique_listeners=('user_id', 'nunique'),
             top_artists=('artist_id', lambda x: x.value_counts().idxmax()),
