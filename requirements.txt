@@ -8,4 +8,3 @@ black
 python-dotenv
 boto3
 pymysql
-apache-airflow-providers-amazon

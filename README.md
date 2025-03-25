@@ -46,3 +46,9 @@ The data pipeline follows the **ETL (Extract, Transform, Load) workflow**:
 - **Amazon Redshift** (Data warehouse for analytics)
 - **Python** (Data processing scripts)
 - **SQL** (Queries for Redshift data validation)V \*\*
+
+![daily](<data/daily basis genre based kpi.jpg>)
+
+
+![hourly](<data/hourly based kpi.jpg>)
+
